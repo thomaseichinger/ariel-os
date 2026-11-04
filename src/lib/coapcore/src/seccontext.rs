@@ -93,12 +93,16 @@ enum SecContextStage<Crypto: lakers::Crypto> {
         c_r: COwn,
         c_i: lakers::ConnId,
         requested_cred_by_value: bool,
+        // When message 1 arrived (`OscoreEdhocHandler::set_now_ms`).
+        started_ms: u64,
     },
     //
     EdhocResponderSentM2 {
         responder: lakers::EdhocResponderWaitM3<Crypto>,
         c_r: COwn,
         c_i: lakers::ConnId,
+        // When message 1 arrived.
+        started_ms: u64,
     },
 
     // FIXME: Also needs a flag for whether M4 was received; if not, it's GC'able
@@ -111,6 +115,13 @@ const LEVEL_ONGOING: usize = 2;
 const LEVEL_EMPTY: usize = 3;
 // FIXME introduce a level for expired states; they're probably the least priority.
 const LEVEL_COUNT: usize = 4;
+
+/// Age in milliseconds after which an unfinished handshake counts as abandoned.
+///
+/// A new message 1 evicts an abandoned handshake before any established context. The value is
+/// well above a slow legitimate handshake (e.g. message 3 retransmitted several times over a
+/// proxied link, after an ECDH that waits for user confirmation).
+pub const HANDSHAKE_STALE_MS: u64 = 30_000;
 
 impl<Crypto: lakers::Crypto, GeneralClaims: generalclaims::GeneralClaims>
     crate::oluru::PriorityLevel for SecContextState<Crypto, GeneralClaims>
@@ -197,6 +208,9 @@ pub struct OscoreEdhocHandler<
     // The correlation of the last OSCORE response built, kept so the application can protect
     // further responses to that request (Observe notifications).
     last_correlation: Option<Correlation>,
+    // Monotonic milliseconds, set by the application before each request (`set_now_ms`); ages
+    // unfinished handshakes.
+    now_ms: u64,
 }
 
 impl<
@@ -238,6 +252,7 @@ impl<
             rng,
             time,
             last_correlation: None,
+            now_ms: 0,
         }
     }
 
@@ -246,6 +261,13 @@ impl<
     /// with [`Self::protect_notification`].
     pub fn take_correlation(&mut self) -> Option<Correlation> {
         self.last_correlation.take()
+    }
+
+    /// Sets the current time in monotonic milliseconds; call it before each request. An unfinished
+    /// handshake older than [`HANDSHAKE_STALE_MS`] is the first context a new EDHOC message 1
+    /// evicts.
+    pub fn set_now_ms(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
     }
 
     /// Pins exactly the OSCORE contexts whose recipient ID `is_pinned` accepts and unpins all
@@ -391,30 +413,47 @@ impl<
 
             let c_r = self.cown_but_not(c_i.as_slice());
 
-            // Never evict a pinned context; prefer `Empty`, then the least recently used
-            // established context, over another client's unfinished handshake (parallel handshakes
-            // must not evict each other); with nothing unpinned, the handshake is refused.
+            // Never evict a pinned context; prefer `Empty` or an abandoned handshake (older than
+            // HANDSHAKE_STALE_MS), then the least recently used established context, over another
+            // client's recent unfinished handshake (parallel handshakes must not evict each other);
+            // with nothing unpinned, the handshake is refused.
+            let now_ms = self.now_ms;
             let new_state = SecContextState {
                 protocol_stage: SecContextStage::EdhocResponderProcessedM1 {
                     c_r,
                     c_i,
                     responder,
                     requested_cred_by_value,
+                    started_ms: now_ms,
                 },
                 authorization: self.authorities.nosec_authorization(),
                 pinned: false,
             };
-            let _evicted = match self.pool.insert_evicting(new_state, |s| {
-                !s.pinned && crate::oluru::PriorityLevel::level(s) != LEVEL_ONGOING
-            }) {
+            let stale = |s: &SecContextState<Crypto, SSC::GeneralClaims>| match s.protocol_stage {
+                SecContextStage::Empty => true,
+                SecContextStage::EdhocResponderProcessedM1 { started_ms, .. }
+                | SecContextStage::EdhocResponderSentM2 { started_ms, .. } => {
+                    now_ms.saturating_sub(started_ms) >= HANDSHAKE_STALE_MS
+                }
+                SecContextStage::Oscore(_) => false,
+            };
+            let _evicted = match self
+                .pool
+                .insert_evicting(new_state, |s| !s.pinned && stale(s))
+            {
                 Ok(evicted) => evicted,
-                Err(new_state) => self
-                    .pool
-                    .insert_evicting(new_state, |s| !s.pinned)
-                    .map_err(|_| {
-                        error!("No security context to spare: all are pinned.");
-                        CoAPError::service_unavailable()
-                    })?,
+                Err(new_state) => match self.pool.insert_evicting(new_state, |s| {
+                    !s.pinned && crate::oluru::PriorityLevel::level(s) != LEVEL_ONGOING
+                }) {
+                    Ok(evicted) => evicted,
+                    Err(new_state) => self
+                        .pool
+                        .insert_evicting(new_state, |s| !s.pinned)
+                        .map_err(|_| {
+                            error!("No security context to spare: all are pinned.");
+                            CoAPError::service_unavailable()
+                        })?,
+                },
             };
 
             Ok(OwnRequestData::EdhocOkSend2(c_r))
@@ -452,6 +491,7 @@ impl<
                             c_i,
                             responder: taken,
                             requested_cred_by_value,
+                            started_ms,
                         },
                     authorization,
                     ..
@@ -482,6 +522,7 @@ impl<
                         responder,
                         c_i,
                         c_r,
+                        started_ms,
                     },
                     authorization,
                     pinned: false,
@@ -725,6 +766,7 @@ impl<
                     responder,
                     c_r,
                     c_i,
+                    ..
                 },
             .. // Discarding original authorization
         } = sec_context_state
