@@ -7,6 +7,10 @@
 * Observe notifications can be protected with `OscoreEdhocHandler::take_correlation` and `OscoreEdhocHandler::protect_notification`, using the new `Correlation` and `NotificationError` types.
 * Security contexts can be pinned with `OscoreEdhocHandler::set_pinned`; pinned contexts are never evicted, and a handshake that finds no unpinned slot is answered with 5.03. `OrderedPool::insert_evicting` evicts selectively.
 
+### Fixed
+
+* A request that fails before it is authenticated no longer drops its security context.
+
 ## 0.1.1
 
 ### Added

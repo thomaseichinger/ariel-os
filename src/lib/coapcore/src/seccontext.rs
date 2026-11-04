@@ -317,6 +317,23 @@ impl<
             .unwrap_or(Err(NotificationError))
     }
 
+    /// Returns a context taken out for a request that failed before it was authenticated, unchanged
+    /// (pin included), in place of the `Empty` placeholder.
+    fn put_back(&mut self, state: SecContextState<Crypto, SSC::GeneralClaims>) {
+        #[allow(clippy::used_underscore_binding, reason = "used only in debug asserts")]
+        let _evicted = self.pool.insert_evicting(state, |s| !s.pinned);
+        debug_assert!(
+            matches!(
+                _evicted,
+                Ok(Some(SecContextState {
+                    protocol_stage: SecContextStage::Empty,
+                    ..
+                }) | None)
+            ),
+            "The Empty placeholder (never pinned) makes room"
+        );
+    }
+
     /// Produces a [`COwn`] (as a recipient identifier) that is both available and not equal to the
     /// peer's recipient identifier.
     fn cown_but_not(&self, c_peer: &[u8]) -> COwn {
@@ -556,26 +573,45 @@ impl<
                 CoAPError::bad_request()
             })?;
 
+        // Until the request is authenticated, nothing in it may cost an established context its
+        // place in the pool: every failure below puts the taken context back unchanged
+        // (`put_back`), keeping its pin.
         let (taken, front_trim_payload) = if with_edhoc {
             if !SSC::HAS_EDHOC {
                 unreachable!(
                     "In this variant, that option is not consumed so the argument is always false"
                 );
             }
-            self.process_edhoc_in_payload(payload, taken)?
+            if matches!(taken.protocol_stage, SecContextStage::Oscore(_)) {
+                // Already established: the EDHOC part is a retransmitted message 3 (or junk);
+                // only its length matters, as in `process_edhoc_in_payload`.
+                let mut decoder = minicbor::decode::Decoder::new(payload);
+                if decoder.decode::<&minicbor::bytes::ByteSlice>().is_err() {
+                    error!("EDHOC request is not prefixed with valid CBOR.");
+                    self.put_back(taken);
+                    return Err(CoAPError::bad_request());
+                }
+                let cutoff = decoder.position();
+                (taken, cutoff)
+            } else {
+                self.process_edhoc_in_payload(payload, taken)?
+            }
         } else {
             (taken, 0)
         };
 
-        let SecContextState {
-            protocol_stage: SecContextStage::Oscore(mut oscore_context),
-            authorization: Some(authorization),
-            pinned,
-        } = taken
-        else {
-            // FIXME: How'd we even get there? Should this be unreachable?
-            error!("Found empty security context.");
-            return Err(CoAPError::bad_request());
+        let (mut oscore_context, authorization, pinned) = match taken {
+            SecContextState {
+                protocol_stage: SecContextStage::Oscore(oscore_context),
+                authorization: Some(authorization),
+                pinned,
+            } => (oscore_context, authorization, pinned),
+            other => {
+                // FIXME: How'd we even get there? Should this be unreachable?
+                error!("Found empty security context.");
+                self.put_back(other);
+                return Err(CoAPError::bad_request());
+            }
         };
 
         if !authorization
@@ -610,24 +646,37 @@ impl<
         // implementation produces the options in the right sequence. Practically
         // (typically, and concretely in Ariel OS), it is given. (And it's not like we have
         // a fallback: inmemory_write has no more expensive option for reshuffling).
+        let mut copied = Ok(());
         for opt in request.options() {
             if opt.number() == coap_numbers::option::EDHOC {
                 continue;
             }
-            copied_message
+            if copied_message
                 .add_option(opt.number(), opt.value())
-                .map_err(|_| {
-                    error!("Options produced in unexpected sequence.");
-                    CoAPError::internal_server_error()
-                })?;
+                .is_err()
+            {
+                error!("Options produced in unexpected sequence.");
+                copied = Err(CoAPError::internal_server_error());
+                break;
+            }
         }
         #[allow(clippy::indexing_slicing, reason = "slice fits by construction")]
-        copied_message
-            .set_payload(&payload[front_trim_payload..])
-            .map_err(|_| {
-                error!("Unexpectedly large EDHOC-less message");
-                CoAPError::internal_server_error()
-            })?;
+        if copied.is_ok()
+            && copied_message
+                .set_payload(&payload[front_trim_payload..])
+                .is_err()
+        {
+            error!("Unexpectedly large EDHOC-less message");
+            copied = Err(CoAPError::internal_server_error());
+        }
+        if let Err(e) = copied {
+            self.put_back(SecContextState {
+                protocol_stage: SecContextStage::Oscore(oscore_context),
+                authorization: Some(authorization),
+                pinned,
+            });
+            return Err(e);
+        }
 
         let decrypted = liboscore::unprotect_request(
             &mut copied_message,
