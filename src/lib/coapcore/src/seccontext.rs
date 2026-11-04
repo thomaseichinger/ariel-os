@@ -391,26 +391,31 @@ impl<
 
             let c_r = self.cown_but_not(c_i.as_slice());
 
-            // Never evict a pinned context; with none to spare, the handshake is refused.
-            let _evicted = self
-                .pool
-                .insert_evicting(
-                    SecContextState {
-                        protocol_stage: SecContextStage::EdhocResponderProcessedM1 {
-                            c_r,
-                            c_i,
-                            responder,
-                            requested_cred_by_value,
-                        },
-                        authorization: self.authorities.nosec_authorization(),
-                        pinned: false,
-                    },
-                    |s| !s.pinned,
-                )
-                .map_err(|_| {
-                    error!("No security context to spare: all are pinned.");
-                    CoAPError::service_unavailable()
-                })?;
+            // Never evict a pinned context; prefer `Empty`, then the least recently used
+            // established context, over another client's unfinished handshake (parallel handshakes
+            // must not evict each other); with nothing unpinned, the handshake is refused.
+            let new_state = SecContextState {
+                protocol_stage: SecContextStage::EdhocResponderProcessedM1 {
+                    c_r,
+                    c_i,
+                    responder,
+                    requested_cred_by_value,
+                },
+                authorization: self.authorities.nosec_authorization(),
+                pinned: false,
+            };
+            let _evicted = match self.pool.insert_evicting(new_state, |s| {
+                !s.pinned && crate::oluru::PriorityLevel::level(s) != LEVEL_ONGOING
+            }) {
+                Ok(evicted) => evicted,
+                Err(new_state) => self
+                    .pool
+                    .insert_evicting(new_state, |s| !s.pinned)
+                    .map_err(|_| {
+                        error!("No security context to spare: all are pinned.");
+                        CoAPError::service_unavailable()
+                    })?,
+            };
 
             Ok(OwnRequestData::EdhocOkSend2(c_r))
         } else {
